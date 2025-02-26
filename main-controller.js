@@ -12,6 +12,7 @@ const cors = require("cors");
 const path = require("path");
 const http = require('http');
 const { Server } = require('socket.io');
+const nodemailer = require("nodemailer");
 
 dotenv.config();
 
@@ -27,7 +28,18 @@ const io = new Server(server, {
   }
 });
 
-// Socket.IO setup (only one connection handler)
+// Set up nodemailer transporter using environment variables
+const transporter = nodemailer.createTransport({
+  host: process.env.EMAIL_HOST,
+  port: process.env.EMAIL_PORT,
+  secure: process.env.EMAIL_PORT == 465, // true for 465, false for others
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
+// Socket.IO setup (even if you're using polling for notifications, this remains available)
 io.on('connection', (socket) => {
   console.log("A client connected:", socket.id);
 
@@ -91,16 +103,16 @@ const authenticateToken = (req, res, next) => {
 
   if (!token || token.trim() === '') {
     console.error("No token provided");
-    return res.sendFile(path.join(__dirname, "public", "login.html"));
+    return res.sendFile(path.join(__dirname, "public", "main-login.html"));
   }
 
   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) {
       console.error("Token verification error:", err);
-      return res.sendFile(path.join(__dirname, "public", "login.html"));
+      return res.sendFile(path.join(__dirname, "public", "main-login.html"));
     }
     req.userId = decoded.userId;
-    req.username = decoded.username; // or decoded.fullName if that's what you set
+    req.username = decoded.username || decoded.fullName; // use fullName if available
     req.user = { role: decoded.role };
     next();
   });
@@ -161,7 +173,7 @@ app.post('/login', async (req, res) => {
 
   new_connection.query(checkUserQuery, [email], async (err, results) => {
     if (err) {
-      console.error(`There seems to be an error ${err}`);
+      console.error(`Error during login: ${err}`);
       return res.status(500).json({ message: 'Error checking user' });
     }
     if (results.length === 0) {
@@ -256,20 +268,44 @@ app.get('/lecturers', (req, res) => {
 
 // Result request route
 app.post('/requests', (req, res) => {
-  const { student_id, course_code, course_title, lecturer_id } = req.body;
+  const { student_id, course_code, course_title, lecturer_id, level_taken, issue_faced } = req.body;
   const query = `
-    INSERT INTO requests (student_id, course_code, course_title, lecturer_id, status)
-    VALUES (?, ?, ?, ?, 'pending')
+    INSERT INTO requests (student_id, course_code, course_title, lecturer_id, status, level_taken, issue_faced)
+    VALUES (?, ?, ?, ?, 'pending', ?, ?)
   `;
-  new_connection.query(query, [student_id, course_code, course_title, lecturer_id], (err, result) => {
+  new_connection.query(query, [student_id, course_code, course_title, lecturer_id, level_taken, issue_faced], (err, result) => {
     if (err) {
       console.error("Error inserting request:", err);
       return res.status(500).json({ message: "Server error" });
     }
-    res.status(201).json({ message: "Request submitted successfully", request_id: result.insertId });
     const requestId = result.insertId;
-    const message = `New result request for ${course_title}`;
-    addNotification(lecturer_id, requestId, message);
+    res.status(201).json({ message: "Request submitted successfully", request_id: requestId });
+    const notificationMessage = `New result upload request for ${course_title}`;
+    addNotification(lecturer_id, requestId, notificationMessage);
+
+    // Send email to lecturer notifying them of the new request.
+    const getLecturerEmailQuery = "SELECT email, username FROM users WHERE user_id = ?";
+    new_connection.query(getLecturerEmailQuery, [lecturer_id], (err, results) => {
+      if (err) {
+        console.error("Error fetching lecturer email:", err);
+      } else if (results.length > 0) {
+        const lecturerEmail = results[0].email;
+        const lecturerName = results[0].username;
+        const mailOptions = {
+          from: process.env.EMAIL_FROM,
+          to: lecturerEmail,
+          subject: "New Request Notification",
+          text: `Hello ${lecturerName},\n\nYou have a new result upload request for ${course_title} . Please log in to review the request.\n\nThank you.`
+        };
+        transporter.sendMail(mailOptions, (error, info) => {
+          if (error) {
+            console.error("Error sending email to lecturer:", error);
+          } else {
+            console.log("Email sent to lecturer:", info.response);
+          }
+        });
+      }
+    });
   });
 });
 
@@ -277,7 +313,7 @@ app.post('/requests', (req, res) => {
 app.get('/student-requests', authenticateToken, authorizeRoles(['student']), (req, res) => {
   const studentId = req.userId;
   const query = `
-    SELECT request_id, course_code, course_title, lecturer_id, status, created_at 
+    SELECT request_id, course_code, course_title, lecturer_id, status, created_at, level_taken 
     FROM requests 
     WHERE student_id = ?
     ORDER BY created_at DESC
@@ -304,18 +340,74 @@ app.get('/lecturer-requests', authenticateToken, authorizeRoles(['lecturer']), (
   });
 });
 
-// Endpoint to update the status of a request
+// GET /requests/:id - Get details for a specific request
+app.get('/requests/:id', authenticateToken, (req, res) => {
+  const requestId = req.params.id;
+  
+  const query = "SELECT * FROM requests WHERE request_id = ?";
+  new_connection.query(query, [requestId], (err, results) => {
+    if (err) {
+      console.error("Error fetching request details:", err);
+      return res.status(500).json({ message: "Error fetching request details" });
+    }
+    if (results.length === 0) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+    
+    const requestDetails = results[0];
+    if (req.user.role === 'student' && req.userId !== requestDetails.student_id) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+    if (req.user.role === 'lecturer' && req.userId !== requestDetails.lecturer_id) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+    
+    res.status(200).json(requestDetails);
+  });
+});
+
+// GET /requests/:id/rejection - Get the rejection reason for a specific request
+app.get('/requests/:id/rejection', authenticateToken, (req, res) => {
+  const requestId = req.params.id;
+  const query = "SELECT student_id, lecturer_id, rejection_reason FROM requests WHERE request_id = ?";
+  new_connection.query(query, [requestId], (err, results) => {
+    if (err) {
+      console.error("Error fetching rejection reason:", err);
+      return res.status(500).json({ message: "Internal server error" });
+    }
+    if (results.length === 0) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+    const request = results[0];
+    if (req.user.role === 'student' && req.userId !== request.student_id) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+    if (req.user.role === 'lecturer' && req.userId !== request.lecturer_id) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+    if (!request.rejection_reason) {
+      return res.status(404).json({ message: "No rejection reason available" });
+    }
+    return res.status(200).json({ rejection_reason: request.rejection_reason });
+  });
+});
+
+// PUT /requests/:id/status - Update the status of a request (with rejection reason support)
 app.put('/requests/:id/status', authenticateToken, authorizeRoles(['lecturer']), (req, res) => {
   const requestId = req.params.id;
-  const { status } = req.body;
+  const { status, rejectionReason } = req.body;
   const validStatuses = ['approved', 'lecturer_rejected'];
 
   if (!validStatuses.includes(status)) {
     return res.status(400).json({ message: "Invalid status value" });
   }
+  if (status === 'lecturer_rejected' && (!rejectionReason || rejectionReason.trim() === '')) {
+    return res.status(400).json({ message: "Rejection reason is required" });
+  }
 
-  const updateQuery = "UPDATE requests SET status = ? WHERE request_id = ?";
-  new_connection.query(updateQuery, [status, requestId], (err, result) => {
+  const rejectionReasonValue = status === 'lecturer_rejected' ? rejectionReason : null;
+  const updateQuery = "UPDATE requests SET status = ?, rejection_reason = ? WHERE request_id = ?";
+  new_connection.query(updateQuery, [status, rejectionReasonValue, requestId], (err, result) => {
     if (err) {
       console.error("Error updating status:", err);
       return res.status(500).json({ message: "Server error" });
@@ -323,38 +415,65 @@ app.put('/requests/:id/status', authenticateToken, authorizeRoles(['lecturer']),
     if (result.affectedRows === 0) {
       return res.status(404).json({ message: "Request not found" });
     }
-
-    // If the new status is approved, fetch the student ID to emit a notification.
-    if (status === 'approved') {
-      const getQuery = "SELECT student_id FROM requests WHERE request_id = ?";
-      new_connection.query(getQuery, [requestId], (err2, results2) => {
-        if (err2) {
-          console.error("Error retrieving student ID:", err2);
-          // Even if notification fails, we can still respond with success.
-          return res.status(200).json({ message: "Status updated successfully" });
-        }
-        if (results2.length > 0) {
-          const studentId = results2[0].student_id;
-          // Emit a targeted notification using rooms if implemented, or broadcast as a fallback.
-          // Here, we use a room approach. Assume each user joins a room named "user_<userId>".
-          io.to(`user_${studentId}`).emit('notification0', {
-            userId: studentId,
-            message: "Your request has been approved by the lecturer"
-          });
-        }
+    const getQuery = "SELECT student_id, course_title FROM requests WHERE request_id = ?";
+    new_connection.query(getQuery, [requestId], (err2, results2) => {
+      if (err2) {
+        console.error("Error retrieving request details:", err2);
         return res.status(200).json({ message: "Status updated successfully" });
-      });
-    } else {
+      }
+      if (results2.length > 0) {
+        const studentId = results2[0].student_id;
+        const courseTitle = results2[0].course_title;
+        let notificationMessage;
+        if (status === 'approved') {
+          notificationMessage = "Your request has been approved by the lecturer";
+        } else {
+          notificationMessage = `Your request was rejected. Reason: ${rejectionReason}`;
+        }
+        addNotification(studentId, requestId, notificationMessage);
+        io.to(`user_${studentId}`).emit('notification', {
+          userId: studentId,
+          message: notificationMessage
+        });
+        // Send email to the student regarding the status update.
+        const getStudentEmailQuery = "SELECT email, username FROM users WHERE user_id = ?";
+        new_connection.query(getStudentEmailQuery, [studentId], (err3, results3) => {
+          if (err3) {
+            console.error("Error fetching student email:", err3);
+          } else if (results3.length > 0) {
+            const studentEmail = results3[0].email;
+            const studentName = results3[0].username;
+            const mailOptions = {
+              from: process.env.EMAIL_FROM,
+              to: studentEmail,
+              subject: "Request Status Update",
+              text: `Hello ${studentName},\n\nYour request for ${courseTitle} has been ${status === 'approved' ? 'approved' : 'rejected'}.${
+                status === 'lecturer_rejected' ? "\nReason: " + rejectionReason : ""
+              }\n\nPlease check the system for details.`
+            };
+            transporter.sendMail(mailOptions, (error, info) => {
+              if (error) {
+                console.error("Error sending email to student:", error);
+              } else {
+                console.log("Email sent to student:", info.response);
+              }
+            });
+          }
+        });
+      }
       return res.status(200).json({ message: "Status updated successfully" });
-    }
+    });
   });
 });
-// notifications
+
+// Notifications helper: add a notification entry
 const addNotification = (userId, requestId, message) => {
   const query = 'INSERT INTO notifications (user_id, request_id, message) VALUES (?, ?, ?)';
   new_connection.query(query, [userId, requestId, message], (err) => {
     if (err) {
       console.error('Error adding notification:', err);
+    } else {
+      console.log(`Notification added for user ${userId} regarding request ${requestId}`);
     }
   });
 };
@@ -368,7 +487,6 @@ app.get('/notifications', authenticateToken, (req, res) => {
     WHERE user_id = ? AND is_read = FALSE 
     ORDER BY created_at DESC
   `;
-  
   new_connection.query(query, [userId], (err, results) => {
     if (err) {
       console.error('Error fetching notifications:', err);
@@ -382,11 +500,9 @@ app.get('/notifications', authenticateToken, (req, res) => {
 app.put('/notifications/read', authenticateToken, (req, res) => {
   const userId = req.userId;
   const { notificationIds } = req.body;
-  
   if (!notificationIds || !Array.isArray(notificationIds)) {
     return res.status(400).json({ message: 'Invalid request data' });
   }
-  
   const query = 'UPDATE notifications SET is_read = TRUE WHERE user_id = ? AND notification_id IN (?)';
   new_connection.query(query, [userId, notificationIds], (err) => {
     if (err) {
@@ -396,8 +512,6 @@ app.put('/notifications/read', authenticateToken, (req, res) => {
     res.status(200).json({ message: 'Notifications marked as read' });
   });
 });
-
-
 
 // Logout route
 app.post('/logout', (req, res) => {
@@ -410,33 +524,26 @@ app.post('/logout', (req, res) => {
 app.get('/lecturer-dashboard', authenticateToken, authorizeRoles(['lecturer']), (req, res) => {
   res.sendFile(path.join(__dirname, "public", "lecturer.html"));
 });
-
 app.get('/login', (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "login.html"));
+  res.sendFile(path.join(__dirname, "public", "main-login.html"));
 });
-
 app.get('/results-request', authenticateToken, authorizeRoles(['student']), (req, res) => {
   res.sendFile(path.join(__dirname, "public", "request.html"));
 });
-
 app.get('/sign-up', (req, res) => {
   res.sendFile(path.join(__dirname, "public", "sign-up.html"));
 });
-
 app.get('/student', authenticateToken, authorizeRoles(['student']), (req, res) => {
   res.sendFile(path.join(__dirname, "public", "student.html"));
 });
-
 app.get('/lecturer-requests', authenticateToken, authorizeRoles(['lecturer']), (req, res) => {
   res.sendFile(path.join(__dirname, "public", "lecturer.html"));
 });
-
 app.get('/request-status', authenticateToken, authorizeRoles(['student']), (req, res) => {
   res.sendFile(path.join(__dirname, "public", "status.html"));
 });
-
-app.get('/notifications', authenticateToken, (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "notifications.html"));
+app.get('/loading', (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "loader.html"));
 });
 
 // Start the server using our HTTP server (with Socket.IO)
@@ -449,7 +556,6 @@ process.on('unhandledRejection', (err) => {
   console.error('Unhandled Rejection:', err);
   process.exit(1);
 });
-
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
   process.exit(1);
